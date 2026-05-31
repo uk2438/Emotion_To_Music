@@ -2,3 +2,8 @@ deepface
 opencv-python
 numpy
 pretty_midi
+Pillow
+torch
+torchvision
+tqdm
+datasets

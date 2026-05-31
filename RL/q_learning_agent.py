@@ -31,21 +31,25 @@ class QLearningAgent:
         # 예를 들어서 state가 [직전 음 = 도, 현재 위치 = 3번째 음]이면 state = (0, 3)이며 q_table[(0,3)] = [0.01, 3.2, 1.5, -0.2, 0.8, -1.1, -2.0, 0.4]이면 다음 행동으로는 action1이 가장 좋은 것임
         self.q_table = defaultdict(lambda: np.zeros(self.action_size))
 
-    def choose_action(self, state, training=True):
+    def choose_action(self, state, training=True, valid_actions=None):
         """epsilon-greedy 방식으로 다음 action을 선택합니다."""
+        if valid_actions is None:
+            valid_actions = list(range(self.action_size))
+
         #random.random()은 0이상 1미만의  랜덤한 숫자를 만들고 이 값이 epsilon보다 작으면 exploration
         if training and random.random() < self.epsilon:
-            return random.randrange(self.action_size)
+            return random.choice(valid_actions)
 
         #exploitation할 때
         q_values = self.q_table[state] #현재 Q_table 가지고 오기
-        max_q = np.max(q_values)
+        valid_q_values = q_values[valid_actions]
+        max_q = np.max(valid_q_values)
 
         # 같은 max Q-value가 여러 개면 랜덤 선택해서 한 음만 과도하게 고르는 현상을 줄여야 해요
-        best_actions = np.where(q_values == max_q)[0] #인덱스 가지고 오기
+        best_actions = [action for action in valid_actions if q_values[action] == max_q]
         return int(random.choice(best_actions))
 
-    def update(self, state, action, reward, next_state, done):
+    def update(self, state, action, reward, next_state, done, valid_next_actions=None):
         """Q-learning 업데이트 식을 적용합니다."""
 
         #현재 q값 가지고오기
@@ -55,7 +59,9 @@ class QLearningAgent:
         if done:
             target = reward
         else:
-            target = reward + self.gamma * np.max(self.q_table[next_state])
+            if valid_next_actions is None:
+                valid_next_actions = list(range(self.action_size))
+            target = reward + self.gamma * np.max(self.q_table[next_state][valid_next_actions])
 
         self.q_table[state][action] = current_q + self.alpha * (target - current_q)
 

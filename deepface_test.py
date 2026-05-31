@@ -18,7 +18,7 @@ def map_emotion_to_music_mode(emotion):
 
 # 테스트할 이미지 경로입니다.
 # 현재 프로젝트 폴더 기준으로 face/laugh.jpg 파일이 있어야 합니다.
-image_path = "face/disgust.jpg"
+image_path = "face/sad.jpg"
 
 try:
     result = DeepFace.analyze(
