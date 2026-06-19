@@ -417,3 +417,278 @@ class FactorizedDQNAgent:
             + float(duration_q_value)
             + float(velocity_q_value)
         ) / 3.0
+
+
+# =====================================================================
+# Branching Dueling DQN (BDQ)
+# ---------------------------------------------------------------------
+# FactorizedDQNAgent과 동일한 외부 인터페이스를 갖는 drop-in 교체용 agent.
+# 바뀌는 것은 "네트워크 구조" 두 가지뿐:
+#   (1) 공유 trunk : pitch/duration/velocity가 하나의 trunk(공통 표현 h)를 공유
+#   (2) dueling   : Q = V(s) + (A - mean A). V(s)는 세 가지가 공유.
+# 선택은 가지별 argmax(masking은 pitch에만 걸리므로 항상 유효 조합),
+# target은 다음 state의 가지별 best Q 평균(공유 target).
+# =====================================================================
+class BranchingDuelingQNetwork:
+    """공유 trunk + value head + 3개 advantage head (numpy 구현)."""
+
+    def __init__(self, state_size, pitch_action_size, duration_action_size,
+                 velocity_action_size, hidden_size=64):
+        self.state_size = state_size
+        self.hidden_size = hidden_size
+        self.n_p = pitch_action_size
+        self.n_d = duration_action_size
+        self.n_v = velocity_action_size
+
+        # --- 공유 trunk: state -> hidden (한 번만 가공) ---
+        self.w1 = np.random.randn(state_size, hidden_size).astype(np.float32) * 0.1
+        self.b1 = np.zeros(hidden_size, dtype=np.float32)
+
+        # --- value head: hidden -> 1 (셋이 공유하는 V(s)) ---
+        self.w_val = np.random.randn(hidden_size, 1).astype(np.float32) * 0.1
+        self.b_val = np.zeros(1, dtype=np.float32)
+
+        # --- advantage heads: hidden -> 각 가지 후보 수 ---
+        self.w_p = np.random.randn(hidden_size, self.n_p).astype(np.float32) * 0.1
+        self.b_p = np.zeros(self.n_p, dtype=np.float32)
+        self.w_d = np.random.randn(hidden_size, self.n_d).astype(np.float32) * 0.1
+        self.b_d = np.zeros(self.n_d, dtype=np.float32)
+        self.w_v = np.random.randn(hidden_size, self.n_v).astype(np.float32) * 0.1
+        self.b_v = np.zeros(self.n_v, dtype=np.float32)
+
+    def _trunk(self, states):
+        states = np.array(states, dtype=np.float32)
+        if states.ndim == 1:
+            states = states.reshape(1, -1)
+        h_pre = states @ self.w1 + self.b1
+        h = np.maximum(h_pre, 0.0)
+        return states, h_pre, h
+
+    @staticmethod
+    def _dueling(V, A):
+        # Q = V + (A - mean_a A)   (가지 후보들 평균을 빼서 기준점 0)
+        return V + (A - A.mean(axis=1, keepdims=True))
+
+    def predict(self, states):
+        """각 가지의 Q값을 반환: (Q_p, Q_d, Q_v)  각 (batch, n)."""
+        _, _, h = self._trunk(states)
+        V = h @ self.w_val + self.b_val          # (B, 1)  공유 V(s)
+        A_p = h @ self.w_p + self.b_p
+        A_d = h @ self.w_d + self.b_d
+        A_v = h @ self.w_v + self.b_v
+        return (
+            self._dueling(V, A_p),
+            self._dueling(V, A_d),
+            self._dueling(V, A_v),
+        )
+
+    def train_batch(self, states, pitch_actions, duration_actions,
+                    velocity_actions, targets, learning_rate):
+        """세 가지 모두 같은 target으로 회귀. 하나의 backprop으로 trunk+모든 head 업데이트."""
+        states, h_pre, h = self._trunk(states)
+        targets = np.array(targets, dtype=np.float32)
+        B = states.shape[0]
+
+        V = h @ self.w_val + self.b_val
+        A_p = h @ self.w_p + self.b_p
+        A_d = h @ self.w_d + self.b_d
+        A_v = h @ self.w_v + self.b_v
+        Q_p = self._dueling(V, A_p)
+        Q_d = self._dueling(V, A_d)
+        Q_v = self._dueling(V, A_v)
+
+        branches = [
+            (Q_p, A_p, pitch_actions, self.n_p, self.w_p),
+            (Q_d, A_d, duration_actions, self.n_d, self.w_d),
+            (Q_v, A_v, velocity_actions, self.n_v, self.w_v),
+        ]
+
+        loss = 0.0
+        dV = np.zeros_like(V)            # (B,1)
+        dh = np.zeros_like(h)            # (B,H)
+        grads = {}                       # head별 grad 저장
+
+        idx = np.arange(B)
+        for name, (Q, A, acts, n, w) in zip(["p", "d", "v"], branches):
+            acts = np.array(acts, dtype=np.int64)
+            q_chosen = Q[idx, acts]                 # (B,)
+            err = q_chosen - targets                # (B,)
+            loss += float(np.mean(err ** 2)) / 3.0
+
+            dq_chosen = (2.0 / (3.0 * B)) * err     # (B,) dL/d(chosen Q)
+            G = np.zeros_like(Q)                     # (B,n) chosen 위치에만 grad
+            G[idx, acts] = dq_chosen
+
+            # Q = V + (A - mean A)
+            dV += G.sum(axis=1, keepdims=True)       # dL/dV (체인)
+            dA = G - (1.0 / n) * G.sum(axis=1, keepdims=True)   # 평균빼기 미분
+
+            # head: A = h @ w + b
+            if name == "p":
+                grads["w_p"] = h.T @ dA; grads["b_p"] = dA.sum(0)
+            elif name == "d":
+                grads["w_d"] = h.T @ dA; grads["b_d"] = dA.sum(0)
+            else:
+                grads["w_v"] = h.T @ dA; grads["b_v"] = dA.sum(0)
+            dh += dA @ w.T
+
+        # value head: V = h @ w_val + b_val
+        grads["w_val"] = h.T @ dV
+        grads["b_val"] = dV.sum(0)
+        dh += dV @ self.w_val.T
+
+        # 공유 trunk 역전파
+        dh_pre = dh * (h_pre > 0)
+        grads["w1"] = states.T @ dh_pre
+        grads["b1"] = dh_pre.sum(0)
+
+        # 업데이트 (모든 파라미터를 같은 loss로 한꺼번에 = dependency 학습)
+        self.w_p -= learning_rate * grads["w_p"]; self.b_p -= learning_rate * grads["b_p"]
+        self.w_d -= learning_rate * grads["w_d"]; self.b_d -= learning_rate * grads["b_d"]
+        self.w_v -= learning_rate * grads["w_v"]; self.b_v -= learning_rate * grads["b_v"]
+        self.w_val -= learning_rate * grads["w_val"]; self.b_val -= learning_rate * grads["b_val"]
+        self.w1 -= learning_rate * grads["w1"]; self.b1 -= learning_rate * grads["b1"]
+        return loss
+
+    def copy_from(self, other):
+        for attr in ["w1", "b1", "w_val", "b_val", "w_p", "b_p", "w_d", "b_d", "w_v", "b_v"]:
+            setattr(self, attr, getattr(other, attr).copy())
+
+    def get_weights(self):
+        return {attr: getattr(self, attr).copy()
+                for attr in ["w1", "b1", "w_val", "b_val", "w_p", "b_p", "w_d", "b_d", "w_v", "b_v"]}
+
+    def set_weights(self, weights):
+        for attr, value in weights.items():
+            setattr(self, attr, value.copy())
+
+
+class BranchingDQNAgent:
+    """Branching Dueling DQN agent. FactorizedDQNAgent과 인터페이스 동일(drop-in)."""
+
+    def __init__(
+        self,
+        state_size,
+        pitch_action_size,
+        duration_action_size,
+        velocity_action_size,
+        hidden_size=64,
+        learning_rate=0.001,
+        gamma=0.95,
+        epsilon=1.0,
+        epsilon_decay=0.995,
+        epsilon_min=0.05,
+        replay_capacity=10000,
+        use_double_dqn=True,
+    ):
+        self.state_size = state_size
+        self.pitch_action_size = pitch_action_size
+        self.duration_action_size = duration_action_size
+        self.velocity_action_size = velocity_action_size
+        self.rhythm_action_size = duration_action_size * velocity_action_size
+        self.action_size = pitch_action_size * self.rhythm_action_size
+        self.hidden_size = hidden_size
+        self.learning_rate = learning_rate
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        self.use_double_dqn = use_double_dqn
+
+        self.q_network = BranchingDuelingQNetwork(
+            state_size, pitch_action_size, duration_action_size, velocity_action_size, hidden_size)
+        self.target_network = BranchingDuelingQNetwork(
+            state_size, pitch_action_size, duration_action_size, velocity_action_size, hidden_size)
+        self.target_network.copy_from(self.q_network)
+        self.memory = ReplayBuffer(capacity=replay_capacity)
+
+    # ---- 선택: 가지별 argmax (masking은 pitch에만 걸리므로 항상 유효 조합) ----
+    def choose_action(self, state, training=True, valid_actions=None):
+        if valid_actions is None:
+            valid_actions = list(range(self.action_size))
+        if training and random.random() < self.epsilon:
+            return random.choice(valid_actions)
+
+        q_p, q_d, q_v = self.q_network.predict(state)
+        valid_pitches = self._valid_pitch_actions(valid_actions)
+        p, d, v = self._branch_argmax(q_p[0], q_d[0], q_v[0], valid_pitches)
+        return self._encode_action(p, d, v)
+
+    def remember(self, state, action, reward, next_state, done, next_valid_actions=None):
+        self.memory.add(state, action, reward, next_state, done, next_valid_actions)
+
+    def replay(self, batch_size):
+        if len(self.memory) < batch_size:
+            return None
+
+        states, actions, rewards, next_states, dones, next_valid_actions = self.memory.sample(batch_size)
+        pitch_actions, duration_actions, velocity_actions = self._decode_actions(actions)
+
+        on_p, on_d, on_v = self.q_network.predict(next_states)
+        tg_p, tg_d, tg_v = self.target_network.predict(next_states)
+
+        max_next_q = []
+        for i, valid in enumerate(next_valid_actions):
+            valid_pitches = self._valid_pitch_actions(valid)
+            if self.use_double_dqn:
+                # action 선택은 online, 평가는 target (Double DQN)
+                p, d, v = self._branch_argmax(on_p[i], on_d[i], on_v[i], valid_pitches)
+                next_value = (tg_p[i][p] + tg_d[i][d] + tg_v[i][v]) / 3.0
+            else:
+                p, d, v = self._branch_argmax(tg_p[i], tg_d[i], tg_v[i], valid_pitches)
+                next_value = (tg_p[i][p] + tg_d[i][d] + tg_v[i][v]) / 3.0
+            max_next_q.append(next_value)
+
+        max_next_q = np.array(max_next_q, dtype=np.float32)
+        targets = rewards + self.gamma * max_next_q * (1.0 - dones)   # 공유 target
+
+        return self.q_network.train_batch(
+            states=states,
+            pitch_actions=pitch_actions,
+            duration_actions=duration_actions,
+            velocity_actions=velocity_actions,
+            targets=targets,
+            learning_rate=self.learning_rate,
+        )
+
+    def update_target_network(self):
+        self.target_network.copy_from(self.q_network)
+
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+
+    def get_model_state(self):
+        return {
+            "q_network": self.q_network.get_weights(),
+            "target_network": self.target_network.get_weights(),
+        }
+
+    def load_model_state(self, model_state):
+        self.q_network.set_weights(model_state["q_network"])
+        self.target_network.set_weights(model_state["target_network"])
+
+    # ---- helpers ----
+    def _branch_argmax(self, q_p, q_d, q_v, valid_pitches):
+        valid_pitches = np.asarray(valid_pitches, dtype=np.int64)
+        p = int(valid_pitches[int(np.argmax(q_p[valid_pitches]))])
+        d = int(np.argmax(q_d))
+        v = int(np.argmax(q_v))
+        return p, d, v
+
+    def _valid_pitch_actions(self, valid_actions):
+        if valid_actions is None:
+            return list(range(self.pitch_action_size))
+        pitches = sorted({int(a) // self.rhythm_action_size for a in valid_actions})
+        return pitches or list(range(self.pitch_action_size))
+
+    def _encode_action(self, pitch_action, duration_action, velocity_action):
+        rhythm_action = duration_action * self.velocity_action_size + velocity_action
+        return int(pitch_action * self.rhythm_action_size + rhythm_action)
+
+    def _decode_actions(self, actions):
+        actions = np.array(actions, dtype=np.int64)
+        pitch_actions = actions // self.rhythm_action_size
+        rhythm_actions = actions % self.rhythm_action_size
+        duration_actions = rhythm_actions // self.velocity_action_size
+        velocity_actions = rhythm_actions % self.velocity_action_size
+        return pitch_actions, duration_actions, velocity_actions

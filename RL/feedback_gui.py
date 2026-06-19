@@ -28,6 +28,7 @@ from main import (
     set_seed,
     summarize_reward_breakdowns,
     train_factorized_dqn_agent,
+    train_branching_dqn_agent, 
 )
 
 
@@ -443,12 +444,13 @@ def generate_from_image(image_path, episodes, melody_length, seed):
         classifier_checkpoint=TEAM_CLASSIFIER_DEFAULT_CHECKPOINT,
     )
     reward_overrides = get_reward_weight_overrides_for_mood(mode)
-    env, agent, rewards, training_metrics = train_factorized_dqn_agent(
+    env, agent, rewards, training_metrics = train_branching_dqn_agent( 
         mode=mode,
         episodes=episodes,
         melody_length=melody_length,
         mood_vector=music_scores,
         batch_size=64,
+        target_update_interval=100,
         reward_weight_overrides=reward_overrides,
     )
     (

@@ -18,6 +18,7 @@ from main import (
     set_seed,
     summarize_reward_breakdowns,
     train_agent,
+    train_branching_dqn_agent,
     train_dqn_agent,
     train_factorized_dqn_agent,
 )
@@ -48,6 +49,20 @@ def _train_for_algorithm(args, mood, seed):
 
     if args.algorithm == "dqn":
         env, agent, rewards, training_metrics = train_dqn_agent(
+            batch_size=args.batch_size,
+            target_update_interval=args.target_update_interval,
+            hidden_size=args.dqn_hidden_size,
+            learning_rate=args.dqn_learning_rate,
+            epsilon_decay=args.dqn_epsilon_decay,
+            epsilon_min=args.dqn_epsilon_min,
+            replay_capacity=args.dqn_replay_capacity,
+            use_double_dqn=not args.disable_double_dqn,
+            **common_kwargs,
+        )
+        return env, agent, rewards, training_metrics, "vector"
+
+    if args.algorithm == "branching_dqn":
+        env, agent, rewards, training_metrics = train_branching_dqn_agent(
             batch_size=args.batch_size,
             target_update_interval=args.target_update_interval,
             hidden_size=args.dqn_hidden_size,
@@ -203,7 +218,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Generate comparable melodies for multiple moods.")
     parser.add_argument(
         "--algorithm",
-        choices=["q_learning", "dqn", "factorized_dqn"],
+        choices=["q_learning", "dqn", "factorized_dqn", "branching_dqn"],
         default="factorized_dqn",
     )
     parser.add_argument(

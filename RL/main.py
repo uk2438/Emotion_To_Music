@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from dqn_agent import DQNAgent, FactorizedDQNAgent
+from dqn_agent import DQNAgent, FactorizedDQNAgent, BranchingDQNAgent
 from melody_env import MODE_PROFILES, MelodyEnv
 from mood_classifier import classify_mood_mock
 from q_learning_agent import QLearningAgent
@@ -370,6 +370,145 @@ def train_factorized_dqn_agent(
         reward_weight_overrides=reward_weight_overrides,
     )
     agent = FactorizedDQNAgent(
+        state_size=env.get_state_size(),
+        pitch_action_size=env.pitch_action_size,
+        duration_action_size=env.duration_action_size,
+        velocity_action_size=env.velocity_action_size,
+        hidden_size=hidden_size,
+        learning_rate=learning_rate,
+        epsilon_decay=epsilon_decay,
+        epsilon_min=epsilon_min,
+        replay_capacity=replay_capacity,
+        use_double_dqn=use_double_dqn,
+    )
+
+    episode_rewards = []
+    episode_losses = []
+    best_training_reward = None
+    best_selection_score = None
+    best_checkpoint_metrics = None
+    best_model_state = None
+
+    for episode in range(episodes):
+        state = env.reset()
+        done = False
+        total_reward = 0.0
+        losses = []
+
+        while not done:
+            valid_actions = env.get_valid_actions()
+            action = agent.choose_action(state, training=True, valid_actions=valid_actions)
+            next_state, reward, done, info = env.step(action)
+            next_valid_actions = env.get_valid_actions()
+
+            agent.remember(
+                state,
+                action,
+                reward,
+                next_state,
+                done,
+                next_valid_actions=next_valid_actions,
+            )
+            loss = agent.replay(batch_size)
+            if loss is not None:
+                losses.append(loss)
+
+            state = next_state
+            total_reward += reward
+
+        agent.decay_epsilon()
+        episode_rewards.append(total_reward)
+        episode_losses.append(sum(losses) / len(losses) if losses else None)
+
+        selection_score, selection_metrics = calculate_checkpoint_selection_score(
+            total_reward=total_reward,
+            info=info,
+            mode=mode,
+            base_notes=env.base_notes,
+        )
+        if best_selection_score is None or selection_score > best_selection_score:
+            best_training_reward = total_reward
+            best_selection_score = selection_score
+            best_checkpoint_metrics = selection_metrics
+            best_model_state = agent.get_model_state()
+
+        if (episode + 1) % target_update_interval == 0:
+            agent.update_target_network()
+
+        if (episode + 1) % 1000 == 0:
+            recent_avg = sum(episode_rewards[-1000:]) / 1000
+            recent_losses = [loss for loss in episode_losses[-1000:] if loss is not None]
+            recent_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0.0
+            print(
+                f"Episode {episode + 1:5d} | "
+                f"Recent Avg Reward: {recent_avg:6.2f} | "
+                f"Recent Loss: {recent_loss:8.4f} | "
+                f"Epsilon: {agent.epsilon:.3f}"
+            )
+
+    agent.update_target_network()
+    if best_model_state is not None:
+        agent.load_model_state(best_model_state)
+    training_metrics = {
+        "episode_losses": episode_losses,
+        "batch_size": batch_size,
+        "target_update_interval": target_update_interval,
+        "hidden_size": hidden_size,
+        "learning_rate": learning_rate,
+        "epsilon_decay": epsilon_decay,
+        "epsilon_min": epsilon_min,
+        "replay_capacity": replay_capacity,
+        "use_double_dqn": use_double_dqn,
+        "best_training_reward": best_training_reward,
+        "best_selection_score": best_selection_score,
+        "best_checkpoint_metrics": best_checkpoint_metrics,
+        "restored_best_checkpoint": best_model_state is not None,
+        "octave_expansion": octave_expansion,
+        "expansion_start_ratio": expansion_start_ratio,
+        "max_pitch_jump": max_pitch_jump,
+        "action_masking": action_masking,
+    }
+
+    return env, agent, episode_rewards, training_metrics
+
+
+def train_branching_dqn_agent(
+    mode="happy",
+    episodes=5000,
+    melody_length=32,
+    mood_vector=None,
+    batch_size=32,
+    target_update_interval=100,
+    hidden_size=128,
+    learning_rate=0.0005,
+    epsilon_decay=0.999,
+    epsilon_min=0.05,
+    replay_capacity=20000,
+    use_double_dqn=True,
+    octave_expansion=False,
+    expansion_start_ratio=0.5,
+    max_pitch_jump=12,
+    action_masking=True,
+    reward_weight_overrides=None,
+):
+    """Branching Dueling DQN(BDQ) agent를 학습합니다.
+
+    factorized와 환경/state/선택 인터페이스는 동일하고, 네트워크만
+    공유 trunk + dueling(V/A) 구조로 바뀝니다. 따라서 두 알고리즘을
+    같은 조건에서 직접 비교할 수 있습니다.
+    """
+    env = MelodyEnv(
+        mode=mode,
+        melody_length=melody_length,
+        state_mode="vector",
+        mood_vector=mood_vector,
+        octave_expansion=octave_expansion,
+        expansion_start_ratio=expansion_start_ratio,
+        max_pitch_jump=max_pitch_jump,
+        action_masking=action_masking,
+        reward_weight_overrides=reward_weight_overrides,
+    )
+    agent = BranchingDQNAgent(
         state_size=env.get_state_size(),
         pitch_action_size=env.pitch_action_size,
         duration_action_size=env.duration_action_size,
@@ -1000,7 +1139,7 @@ def save_experiment_summary(
             "use_double_dqn": agent.use_double_dqn,
             "replay_buffer_size": len(agent.memory),
         }
-    elif algorithm == "factorized_dqn":
+    elif algorithm in ("factorized_dqn", "branching_dqn"):
         agent_params = {
             "state_size": agent.state_size,
             "action_size": agent.action_size,
@@ -1100,9 +1239,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train the EmotionRL baseline or DQN agent.")
     parser.add_argument(
         "--algorithm",
-        choices=["q_learning", "dqn", "factorized_dqn"],
+        choices=["q_learning", "dqn", "factorized_dqn", "branching_dqn"],
         default="factorized_dqn",
-        help="Training algorithm to run. The project default is factorized_dqn for event-factor learning.",
+        help="Training algorithm to run. branching_dqn is BDQ (shared trunk + dueling).",
     )
     parser.add_argument(
         "--mood-source",
@@ -1234,6 +1373,28 @@ def main():
     elif args.algorithm == "dqn":
         # 여기서는 classifier의 7-class mood vector가 DQN state의 일부가 됩니다.
         env, agent, rewards, training_metrics = train_dqn_agent(
+            mode=mode,
+            episodes=episodes,
+            melody_length=melody_length,
+            mood_vector=emotion_scores,
+            batch_size=args.batch_size,
+            target_update_interval=args.target_update_interval,
+            hidden_size=args.dqn_hidden_size,
+            learning_rate=args.dqn_learning_rate,
+            epsilon_decay=args.dqn_epsilon_decay,
+            epsilon_min=args.dqn_epsilon_min,
+            replay_capacity=args.dqn_replay_capacity,
+            use_double_dqn=not args.disable_double_dqn,
+            octave_expansion=args.octave_expansion,
+            expansion_start_ratio=args.expansion_start_ratio,
+            max_pitch_jump=args.max_pitch_jump,
+            action_masking=not args.disable_action_masking,
+        )
+        state_mode = "vector"
+    elif args.algorithm == "branching_dqn":
+        # BDQ: factorized와 동일한 mood-conditioned state/선택을 쓰되,
+        # 네트워크만 공유 trunk + dueling(V/A) 구조로 바뀝니다.
+        env, agent, rewards, training_metrics = train_branching_dqn_agent(
             mode=mode,
             episodes=episodes,
             melody_length=melody_length,
